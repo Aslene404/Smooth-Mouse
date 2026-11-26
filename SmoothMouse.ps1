@@ -1,6 +1,7 @@
 # ==============================
 # Find the biggest red area on screen, move the cursor there, and click it
 # Human-like motion: random arc + dramatic smooth speed changes
+# Small console window pinned to a screen corner
 # Fully automatic: starts on run, exits when done
 # Use Windows PowerShell 5.1
 # ==============================
@@ -17,10 +18,14 @@ public class MouseControl {
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
     [DllImport("user32.dll")] public static extern int GetSystemMetrics(int nIndex);
     [DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, UIntPtr dwExtraInfo);
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT r);
+    [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
+    [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
     [DllImport("winmm.dll")]  public static extern uint timeBeginPeriod(uint ms);
     [DllImport("winmm.dll")]  public static extern uint timeEndPeriod(uint ms);
 
     public struct POINT { public int X; public int Y; }
+    public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
 
     public const uint LEFTDOWN  = 0x0002;
     public const uint LEFTUP    = 0x0004;
@@ -129,6 +134,13 @@ $scanIntervalMs = 250
 $clickButton   = "Left"     # "Left" or "Right"
 $doubleClick   = $false     # $true = double click
 
+# Console window settings
+$windowCorner  = "BottomRight"   # TopLeft, TopRight, BottomLeft, BottomRight
+$windowCols    = 10              # width in characters (smaller = smaller window)
+$windowRows    = 2            # height in lines
+$windowMargin  = 8               # gap from the screen edge in pixels
+$alwaysOnTop   = $true           # keep the small window visible above other windows
+
 # 0 = automatic duration based on distance, or a fixed number of seconds
 $durationOverride = 0
 
@@ -149,6 +161,46 @@ function Get-RandRange([double]$min, [double]$max) {
 
 function Clamp([double]$v, [double]$lo, [double]$hi) {
     return [Math]::Max($lo, [Math]::Min($hi, $v))
+}
+
+# Shrinks the console window and pins it to a corner of the primary screen
+function Set-CornerWindow {
+    try {
+        $raw = $Host.UI.RawUI
+        $maxW = $raw.MaxPhysicalWindowSize.Width
+        $maxH = $raw.MaxPhysicalWindowSize.Height
+        $cols = [int][Math]::Min($windowCols, $maxW)
+        $rows = [int][Math]::Min($windowRows, $maxH)
+
+        # Shrink the window first, then the buffer, then set the final window size
+        $cur = $raw.WindowSize
+        $raw.WindowSize = New-Object System.Management.Automation.Host.Size ([Math]::Min($cur.Width, $cols)), ([Math]::Min($cur.Height, $rows))
+        $raw.BufferSize = New-Object System.Management.Automation.Host.Size $cols, $rows
+        $raw.WindowSize = New-Object System.Management.Automation.Host.Size $cols, $rows
+    }
+    catch { }
+
+    $hwnd = [MouseControl]::GetConsoleWindow()
+    if ($hwnd -eq [IntPtr]::Zero) { return }
+
+    $r = New-Object MouseControl+RECT
+    if (-not [MouseControl]::GetWindowRect($hwnd, [ref]$r)) { return }
+
+    $w = $r.Right - $r.Left
+    $h = $r.Bottom - $r.Top
+    $screenW = [MouseControl]::GetSystemMetrics(0)   # primary screen width
+    $screenH = [MouseControl]::GetSystemMetrics(1)   # primary screen height
+
+    switch ($windowCorner) {
+        "TopLeft"     { $x = $windowMargin;                       $y = $windowMargin }
+        "TopRight"    { $x = $screenW - $w - $windowMargin;       $y = $windowMargin }
+        "BottomLeft"  { $x = $windowMargin;                       $y = $screenH - $h - $windowMargin }
+        default       { $x = $screenW - $w - $windowMargin;       $y = $screenH - $h - $windowMargin }
+    }
+
+    $after = if ($alwaysOnTop) { [IntPtr](-1) } else { [IntPtr](-2) }
+    # SWP_NOSIZE (0x1) | SWP_NOACTIVATE (0x10) | SWP_SHOWWINDOW (0x40)
+    [void][MouseControl]::SetWindowPos($hwnd, $after, [int]$x, [int]$y, 0, 0, 0x51)
 }
 
 # One human-like click: random press duration
@@ -195,7 +247,7 @@ function Move-Human([double]$tx, [double]$ty) {
     $dist = [Math]::Sqrt($dx * $dx + $dy * $dy)
 
     if ($dist -lt 1) {
-        Write-Host "Already at the red area."
+        Write-Host "Already on target."
         return
     }
 
@@ -266,7 +318,7 @@ function Move-Human([double]$tx, [double]$ty) {
     $total = $cum[$N]
     for ($i = 0; $i -le $N; $i++) { $cum[$i] = $cum[$i] / $total }
 
-    Write-Host ("Moving from X={0} Y={1} to X={2} Y={3} (~{4}s, {5} speed events)" -f [int]$sx, [int]$sy, [int]$tx, [int]$ty, [Math]::Round($duration, 2), $eventCount)
+    Write-Host ("Moving ({0},{1}) -> ({2},{3})" -f [int]$sx, [int]$sy, [int]$tx, [int]$ty)
 
     # Short human reaction pause
     [System.Threading.Thread]::Sleep([int](Get-RandRange 80 220))
@@ -308,8 +360,10 @@ function Move-Human([double]$tx, [double]$ty) {
 [void][MouseControl]::SetProcessDPIAware()
 [void][MouseControl]::timeBeginPeriod(1)
 
+Set-CornerWindow
+
 try {
-    Write-Host "Searching for a red area..."
+    Write-Host "Searching for red..."
     $searchWatch = [System.Diagnostics.Stopwatch]::StartNew()
     $found = $null
 
@@ -322,13 +376,15 @@ try {
     }
 
     if (-not $found) {
-        Write-Host "No red area found - exiting."
+        Write-Host "No red found - exiting."
+        Start-Sleep -Seconds 2
         return
     }
 
-    Write-Host ("Red area found at X={0} Y={1} (~{2} px)" -f $found[0], $found[1], $found[2])
+    Write-Host ("Red at X={0} Y={1}" -f $found[0], $found[1])
 
     Move-Human $found[0] $found[1]
+    Click-Human
     Click-Human
 
     Write-Host "Clicked - exiting."
